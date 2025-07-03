@@ -243,6 +243,48 @@ class Docx(DocxParser):
             tbls.append(((None, html), ""))
         return new_line, tbls
 
+class Excel(ExcelParser):
+    def __init__(self):
+        pass
+
+    def __call__(self, fnm):
+        file_like_object = BytesIO(fnm) if not isinstance(fnm, str) else fnm
+        wb = self._load_excel_to_workbook(file_like_object)
+
+        res = []
+        lines = []
+        for sheetname in wb.sheetnames:
+            ws = wb[sheetname]
+            rows = list(ws.rows)
+            if not rows:
+                continue
+            ti = list(rows[0])
+            for r in list(rows[1:]):
+                fields = []
+                for i, c in enumerate(r):
+                    if not c.value:
+                        continue
+                    t = str(ti[i].value) if i < len(ti) else ""
+                    t += ("：" if t else "") + str(c.value)
+                    fields.append(t)
+                line = "; ".join(fields)
+                if sheetname.lower().find("sheet") < 0:
+                    line += " ——" + sheetname
+                res.append(line)
+
+            for img in ws._images:
+                anchor = img.anchor
+                ref = anchor._from
+                image = Image.open(img.ref).convert("RGB")
+                start_col = ref.col - 5 if (ref.col - 5 >= 0) else 0
+                reference = ""
+                for i in range(start_col, ref.col):
+                    if rows[ref.row][i].value:
+                        reference += rows[0][i].value + ": " + rows[ref.row][i].value
+                print(reference)
+                lines.append((reference, image))
+        return res, lines
+
 
 class Pdf(PdfParser):
     def __init__(self):
@@ -454,11 +496,31 @@ def chunk(filename, binary=None, from_page=0, to_page=100000,
 
     elif re.search(r"\.(csv|xlsx?)$", filename, re.IGNORECASE):
         callback(0.1, "Start to parse.")
-        excel_parser = ExcelParser()
+        try:
+            vision_model = LLMBundle(kwargs["tenant_id"], LLMType.IMAGE2TEXT)
+            callback(0.15, "Visual model detected. Attempting to enhance figure extraction...")
+        except Exception:
+            vision_model = None
+
+        lines = []
         if parser_config.get("html4excel"):
-            sections = [(_, "") for _ in excel_parser.html(binary, 12) if _]
+            sections = Excel().html(binary, 12)
         else:
-            sections = [(_, "") for _ in excel_parser(binary) if _]
+            sections, lines = Excel()(binary)
+        sections = [(_, "") for _ in sections if _]
+
+        if vision_model:
+            tbls = []
+            figures_data = vision_figure_parser_figure_data_wraper(lines)
+            print("figures_data" + str(len(figures_data)))
+            try:
+                excel_vision_parser = VisionFigureParser(vision_model=vision_model, figures_data=figures_data, **kwargs)
+                boosted_figures = excel_vision_parser(callback=callback)
+                tbls.extend(boosted_figures)
+            except Exception as e:
+                callback(0.6, f"Visual model error: {e}. Skipping figure parsing enhancement.")
+            res = tokenize_table(tbls, doc, is_english)
+            print("res_len" + str(len(res)))
 
     elif re.search(r"\.(txt|py|js|java|c|cpp|h|php|go|ts|sh|cs|kt|sql)$", filename, re.IGNORECASE):
         callback(0.1, "Start to parse.")
@@ -540,7 +602,8 @@ def chunk(filename, binary=None, from_page=0, to_page=100000,
             return chunks
 
         res.extend(tokenize_chunks(chunks, doc, is_english, pdf_parser))
-    
+        print("res_len" + str(len(res)))
+
     logging.info("naive_merge({}): {}".format(filename, timer() - st))
     return res
 

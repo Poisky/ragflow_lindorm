@@ -340,7 +340,6 @@ def chat(dialog, messages, stream=True, **kwargs):
 
     def decorate_answer(answer):
         nonlocal prompt_config, knowledges, kwargs, kbinfos, prompt, retrieval_ts, questions, langfuse_tracer
-
         refs = []
         ans = answer.split("</think>")
         think = ""
