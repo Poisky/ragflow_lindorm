@@ -25,32 +25,52 @@
         "type": "knn_vector",
         "dimension": 512,
         "method": {
+          "engine": "lvector",
           "space_type": "cosinesimil",
-          "name": "flat"
+          "name": "hnsw",
+          "parameters": {
+            "m": 24,
+            "ef_construction": 500
+         }
         }
       },
       "q_768_vec": {
         "type": "knn_vector",
         "dimension": 768,
         "method": {
+          "engine": "lvector",
           "space_type": "cosinesimil",
-          "name": "flat"
+          "name": "hnsw",
+          "parameters": {
+            "m": 24,
+            "ef_construction": 500
+         }
         }
       },
       "q_1024_vec": {
         "type": "knn_vector",
         "dimension": 1024,
         "method": {
+          "engine": "lvector",
           "space_type": "cosinesimil",
-          "name": "flat"
+          "name": "hnsw",
+          "parameters": {
+            "m": 24,
+            "ef_construction": 500
+         }
         }
       },
       "q_1536_vec": {
         "type": "knn_vector",
         "dimension": 1536,
         "method": {
+          "engine": "lvector",
           "space_type": "cosinesimil",
-          "name": "flat"
+          "name": "hnsw",
+          "parameters": {
+            "m": 24,
+            "ef_construction": 500
+         }
         }
       }
     },
