@@ -47,7 +47,10 @@ class LindormConnection(DocStoreConnection):
                     settings.Lindorm["hosts"].split(","),
                     http_auth=(settings.Lindorm["username"], settings.Lindorm["password"]),
                     verify_certs=False,
-                    timeout=600
+                    pool_maxsize=settings.Lindorm.get("pool_maxsize", 20),
+                    timeout=30,
+                    retry_on_timeout=True,
+                    max_retries=3
                 )
                 if self.client:
                     self.info = self.client.info()
@@ -141,37 +144,38 @@ class LindormConnection(DocStoreConnection):
             aggFields: list[str] = [],
             rank_feature: dict | None = None
     ):
-        """
-        Refers to https://github.com/opensearch-project/opensearch-py/blob/main/guides/dsl.md
-        """
-        use_knn = False
         if isinstance(indexNames, str):
             indexNames = indexNames.split(",")
         assert isinstance(indexNames, list) and len(indexNames) > 0
         assert "_id" not in condition
 
-        bqry = Q("bool", must=[])
+        filter_clauses = []
         condition["kb_id"] = knowledgebaseIds
         for k, v in condition.items():
             if k == "available_int":
                 if v == 0:
-                    bqry.filter.append(Q("range", available_int={"lt": 1}))
+                    filter_clauses.append(Q("range", available_int={"lt": 1}))
                 else:
-                    bqry.filter.append(
+                    filter_clauses.append(
                         Q("bool", must_not=Q("range", available_int={"lt": 1})))
                 continue
             if not v:
                 continue
             if isinstance(v, list):
-                bqry.filter.append(Q("terms", **{k: v}))
+                filter_clauses.append(Q("terms", **{k: v}))
             elif isinstance(v, str) or isinstance(v, int):
-                bqry.filter.append(Q("term", **{k: v}))
+                filter_clauses.append(Q("term", **{k: v}))
             else:
                 raise Exception(
                     f"Condition `{str(k)}={str(v)}` value type is {str(type(v))}, expected to be int, str or list.")
 
-        s = Search()
-        vector_similarity_weight = 0.5
+        filter_query = Q("bool", filter=filter_clauses)
+
+        q_vector_dict = None
+
+        s_text = Search()
+        full_text_query = Q("bool", must=[], filter=filter_query.filter)
+
         for m in matchExprs:
             if isinstance(m, FusionExpr) and m.method == "weighted_sum" and "weights" in m.fusion_params:
                 assert len(matchExprs) == 3 and isinstance(matchExprs[0], MatchTextExpr) and isinstance(matchExprs[1],
@@ -179,91 +183,201 @@ class LindormConnection(DocStoreConnection):
                     matchExprs[2], FusionExpr)
                 weights = m.fusion_params["weights"]
                 vector_similarity_weight = float(weights.split(",")[1])
-        knn_query = {}
         for m in matchExprs:
             if isinstance(m, MatchTextExpr):
                 minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)
                 if isinstance(minimum_should_match, float):
                     minimum_should_match = str(int(minimum_should_match * 100)) + "%"
-                bqry.must.append(Q("query_string", fields=m.fields,
-                                   type="best_fields", query=m.matching_text,
-                                   minimum_should_match=minimum_should_match,
-                                   boost=1))
-                bqry.boost = 1.0 - vector_similarity_weight
+                text_must_clause = Q("query_string", fields=m.fields,
+                                     type="best_fields", query=m.matching_text,
+                                     minimum_should_match=minimum_should_match)
 
-            # Elasticsearch has the encapsulation of KNN_search in python sdk
-            # while the Python SDK for OpenSearch does not provide encapsulation for KNN_search,
-            # the following codes implement KNN_search in OpenSearch using DSL
-            # Besides, Opensearch's DSL for KNN_search query syntax differs from that in Elasticsearch, I also made some adaptions for it
+                full_text_query = Q("bool", must=[text_must_clause], filter=filter_query.filter)
             elif isinstance(m, MatchDenseExpr):
-                assert (bqry is not None)
-                similarity = 0.0
-                if "similarity" in m.extra_options:
-                    similarity = m.extra_options["similarity"]
-                use_knn = True
-                vector_column_name = m.vector_column_name
-                knn_query[vector_column_name] = {}
-                knn_query[vector_column_name]["vector"] = list(m.embedding_data)
-                knn_query[vector_column_name]["k"] = m.topn
-                knn_query[vector_column_name]["filter"] = bqry.to_dict()
-                knn_query[vector_column_name]["boost"] = similarity
+                knn_filter_dict = filter_query.to_dict()
 
-        if bqry and rank_feature:
+                knn_inner_query = {
+                    m.vector_column_name: {
+                        "vector": list(m.embedding_data),
+                        "k": m.topn,
+                        "filter": knn_filter_dict
+                    }
+                }
+
+                q_vector_dict = {"query": {"knn": knn_inner_query}, "size": limit, "from": offset, "_source": True}
+
+        if full_text_query and rank_feature:
+            full_text_query.should = []
             for fld, sc in rank_feature.items():
                 if fld != PAGERANK_FLD:
                     fld = f"{TAG_FLD}.{fld}"
-                bqry.should.append(Q("rank_feature", field=fld, linear={}, boost=sc))
+                full_text_query.should.append(Q("rank_feature", field=fld, linear={}, boost=sc))
 
-        if bqry:
-            s = s.query(bqry)
+        if full_text_query :
+            s_text = s_text.query(full_text_query)
+
         for field in highlightFields:
-            s = s.highlight(field, force_source=True, no_match_size=30, require_field_match=False)
+            s_text = s_text.highlight(field, force_source=True, no_match_size=30, require_field_match=False)
 
         if orderBy:
             orders = list()
             for field, order in orderBy.fields:
                 order = "asc" if order == 0 else "desc"
                 if field in ["page_num_int", "top_int"]:
-                    order_info = {"order": order, "unmapped_type": "float",
-                                  "mode": "avg", "numeric_type": "double"}
+                    order_info = {"order": order, "unmapped_type": "float", "mode": "avg",
+                                  "numeric_type": "double"}
                 elif field.endswith("_int") or field.endswith("_flt"):
                     order_info = {"order": order, "unmapped_type": "float"}
                 else:
                     order_info = {"order": order, "unmapped_type": "text"}
                 orders.append({field: order_info})
-            s = s.sort(*orders)
+            s_text = s_text.sort(*orders)
 
         for fld in aggFields:
-            s.aggs.bucket(f'aggs_{fld}', 'terms', field=fld, size=1000000)
+            s_text.aggs.bucket(f'aggs_{fld}', 'terms', field=fld, size=1000000)
 
         if limit > 0:
-            s = s[offset:offset + limit]
-        q = s.to_dict()
-        logger.debug(f"LindormConnection.search {str(indexNames)} query: " + json.dumps(q))
+            s_text = s_text[offset:offset + limit]
 
-        if use_knn:
-            del q["query"]
-            q["query"] = {"knn": knn_query}
+        q_text_dict = s_text.to_dict()
+        q_text_dict["_source"] = True
 
-        for i in range(ATTEMPT_TIME):
-            try:
-                res = self.client.search(index=indexNames,
-                                     body=q,
-                                     timeout=600,
-                                     # search_type="dfs_query_then_fetch",
-                                     track_total_hits=True,
-                                     _source=True)
-                if str(res.get("timed_out", "")).lower() == "true":
-                    raise Exception("Lindorm Timeout.")
-                logger.debug(f"LindormConnection.search {str(indexNames)} res: " + str(res))
-                return res
-            except Exception as e:
-                logger.exception(f"LindormConnection.search {str(indexNames)} query: " + str(q))
-                if str(e).find("Timeout") > 0:
-                    continue
-                raise e
-        logger.error("LindormConnection.search timeout for 3 times!")
-        raise Exception("LindormConnection.search timeout.")
+        if q_text_dict and q_vector_dict:
+            msearch_body = []
+            target_index_str = ",".join(indexNames)
+
+            if q_text_dict:
+                msearch_body.append({"index": target_index_str})
+                msearch_body.append(q_text_dict)
+
+            if q_vector_dict:
+                msearch_body.append({"index": target_index_str})
+                msearch_body.append(q_vector_dict)
+
+            for i in range(ATTEMPT_TIME):
+                try:
+                    res = self.client.msearch(
+                        body=msearch_body,
+                        timeout=600
+                    )
+                    if any(response.get("timed_out", False) for response in res.get("responses", [])):
+                        raise Exception("Lindorm Timeout: One or more sub-queries in msearch timed out.")
+
+                    logger.debug(f"LindormConnection.search msearch res: " + str(res))
+
+                    return self.rerank_with_rrf(res["responses"], rrf_rank_constant=60, vector_similarity_weight = vector_similarity_weight)
+
+                except Exception as e:
+                    logger.exception(
+                        f"LindormConnection.search msearch failed for indices {str(indexNames)} with body: " + str(
+                            msearch_body))
+                    if "Timeout" in str(e):
+                        continue
+                    raise e
+
+            logger.error(f"LindormConnection.search msearch timeout for {ATTEMPT_TIME} times!")
+            raise Exception("LindormConnection.search msearch timeout.")
+        else:
+            for i in range(ATTEMPT_TIME):
+                try:
+                    res = self.client.search(index=indexNames,
+                                         body=q_text_dict,
+                                         timeout=600)
+                    if str(res.get("timed_out", "")).lower() == "true":
+                        raise Exception("LindormConnection Timeout.")
+                    logger.debug(f"LindormConnection.search {str(indexNames)} res: " + str(res))
+                    return res
+                except Exception as e:
+                    logger.exception(f"LindormConnection.search {str(indexNames)} query: " + str(q_text_dict))
+                    if "Timeout" in str(e):
+                        continue
+                    raise e
+            logger.error(f"LindormConnection.search timeout for {ATTEMPT_TIME} times!")
+            raise Exception("LindormConnection.search timeout.")
+
+    def rerank_with_rrf(self, msearch_responses: list, rrf_rank_constant: int = 60, vector_similarity_weight: float = 0.5):
+        text_response = msearch_responses[0] if len(msearch_responses) > 0 else None
+        vector_response = msearch_responses[1] if len(msearch_responses) > 1 else None
+        if text_response is None and vector_response is None:
+            return {
+                "took": 0, "timed_out": False,
+                "hits": {"total": {"value": 0, "relation": "eq"}, "max_score": 0.0, "hits": []}
+            }
+        elif text_response is None:
+            return vector_response
+        elif vector_response is None:
+            return text_response
+
+        scores = {}
+        docs = {}
+
+        text_rank_constant = self.get_rank_constant_by_factor(vector_similarity_weight, rrf_rank_constant)
+
+        if text_response and not text_response.get("error"):
+            text_hits = text_response.get("hits", {}).get("hits", [])
+            for rank, hit in enumerate(text_hits, 1):
+                doc_id = hit["_id"]
+                rrf_score = 1.0 / (text_rank_constant + rank)
+                scores[doc_id] = scores.get(doc_id, 0) + rrf_score
+                if doc_id not in docs:
+                    docs[doc_id] = hit
+
+        if vector_response and not vector_response.get("error"):
+            vector_hits = vector_response.get("hits", {}).get("hits", [])
+            for rank, hit in enumerate(vector_hits, 1):
+                doc_id = hit["_id"]
+                rrf_score = 1.0 / (rrf_rank_constant + rank)
+                scores[doc_id] = scores.get(doc_id, 0) + rrf_score
+                if doc_id not in docs:
+                    docs[doc_id] = hit
+
+        sorted_docs = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+        final_hits = []
+        for doc_id, final_score in sorted_docs:
+            doc_info = docs[doc_id]
+
+            source_data = doc_info.get("_source") or {}
+
+            if isinstance(source_data, dict):
+                source_data['id'] = doc_id
+
+            final_hit = {
+                "_index": doc_info.get("_index"),
+                "_id": doc_id,
+                "_score": final_score,
+                "_source": source_data,
+                "highlight": doc_info.get("highlight")
+            }
+            final_hits.append(final_hit)
+
+        total_took = text_response.get("took", 0) + (vector_response.get("took", 0) if vector_response else 0)
+        is_timed_out = text_response.get("timed_out", False) or (
+            vector_response.get("timed_out", False) if vector_response else False)
+
+        final_result = {
+            "took": total_took,
+            "timed_out": is_timed_out,
+            "hits": {
+                "total": {"value": len(docs), "relation": "eq"},
+                "max_score": sorted_docs[0][1] if sorted_docs else 0.0,
+                "hits": final_hits
+            }
+        }
+
+        return final_result
+
+    def get_rank_constant_by_factor(self, knn_weight_factor: float, rrf_rank_constant: int) -> int:
+        rank_constant_factor: float
+        if knn_weight_factor < 0 or knn_weight_factor > 1:
+            rank_constant_factor = 0.5
+        elif knn_weight_factor == 0:
+            rank_constant_factor = 1e-6  # 0.000001
+        elif knn_weight_factor == 1:
+            rank_constant_factor = 1 / 1e-6  # 1,000,000
+        else:
+            rank_constant_factor = knn_weight_factor / (1 - knn_weight_factor)
+        return int(rrf_rank_constant * rank_constant_factor)
 
     def get(self, chunkId: str, indexName: str, knowledgebaseIds: list[str]) -> dict | None:
         print("LindormConnection.get")
