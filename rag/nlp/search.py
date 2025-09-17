@@ -78,12 +78,13 @@ class Dealer:
         pg = int(req.get("page", 1)) - 1
         topk = int(req.get("topk", 1024))
         ps = int(req.get("size", topk))
+        vector_similarity_weight = float(req.get("vector_similarity_weight", 0.3))
         offset, limit = pg * ps, ps
 
         src = req.get("fields",
                       ["docnm_kwd", "content_ltks", "kb_id", "img_id", "title_tks", "important_kwd", "position_int",
                        "doc_id", "page_num_int", "top_int", "create_timestamp_flt", "knowledge_graph_kwd",
-                       "question_kwd", "question_tks", "doc_type_kwd",
+                       "question_kwd", "question_tks", "doc_type_kwd", "_score",
                        "available_int", "content_with_weight", PAGERANK_FLD, TAG_FLD])
         kwds = set([])
 
@@ -111,7 +112,7 @@ class Dealer:
                 q_vec = matchDense.embedding_data
                 src.append(f"q_{len(q_vec)}_vec")
 
-                fusionExpr = FusionExpr("weighted_sum", topk, {"weights": "0.05, 0.95"})
+                fusionExpr = FusionExpr("weighted_sum", topk, {"weights": f"{1-vector_similarity_weight}, {vector_similarity_weight}"})
                 matchExprs = [matchText, matchDense, fusionExpr]
 
                 res = self.dataStore.search(src, highlightFields, filters, matchExprs, orderBy, offset, limit,
@@ -286,8 +287,12 @@ class Dealer:
         vector_column = f"q_{vector_size}_vec"
         zero_vector = [0.0] * vector_size
         ins_embd = []
+        score = []
         for chunk_id in sres.ids:
             vector = sres.field[chunk_id].get(vector_column, zero_vector)
+            score_value = sres.field[chunk_id].get("_score", 0)
+            score_value = float(score_value)
+            score.append(score_value)
             if isinstance(vector, str):
                 vector = [get_float(v) for v in vector.split("\t")]
             ins_embd.append(vector)
@@ -309,7 +314,12 @@ class Dealer:
         ## For rank feature(tag_fea) scores.
         rank_fea = self._rank_feature_scores(rank_feature, sres)
 
-        sim, tksim, vtsim = self.qryr.hybrid_similarity(sres.query_vector,
+        if self.dataStore.__class__.__name__ == 'LindormConnection':
+            sim, tksim, vtsim = self.qryr.hybrid_similarity_with_score(score,
+                                                            keywords,
+                                                            ins_tw, tkweight, vtweight)
+        else:
+            sim, tksim, vtsim = self.qryr.hybrid_similarity(sres.query_vector,
                                                         ins_embd,
                                                         keywords,
                                                         ins_tw, tkweight, vtweight)
@@ -357,9 +367,11 @@ class Dealer:
         RERANK_LIMIT = int(RERANK_LIMIT//page_size + ((RERANK_LIMIT%page_size)/(page_size*1.) + 0.5)) * page_size if page_size>1 else 1
         if RERANK_LIMIT < 1: ## when page_size is very large the RERANK_LIMIT will be 0.
             RERANK_LIMIT = 1
+        elif abs(vector_similarity_weight - 1.0) < 1e-6 and not rerank_mdl:
+            RERANK_LIMIT = page_size
         req = {"kb_ids": kb_ids, "doc_ids": doc_ids, "page": math.ceil(page_size*page/RERANK_LIMIT), "size": RERANK_LIMIT,
                "question": question, "vector": True, "topk": top,
-               "similarity": similarity_threshold,
+               "similarity": similarity_threshold, "vector_similarity_weight": vector_similarity_weight,
                "available_int": 1}
 
 

@@ -47,7 +47,7 @@ class LindormConnection(DocStoreConnection):
                     settings.Lindorm["hosts"].split(","),
                     http_auth=(settings.Lindorm["username"], settings.Lindorm["password"]),
                     verify_certs=False,
-                    pool_maxsize=settings.Lindorm.get("pool_maxsize", 20),
+                    pool_maxsize=settings.Lindorm.get("pool_maxsize", 200),
                     timeout=30,
                     retry_on_timeout=True,
                     max_retries=3
@@ -156,8 +156,7 @@ class LindormConnection(DocStoreConnection):
                 if v == 0:
                     filter_clauses.append(Q("range", available_int={"lt": 1}))
                 else:
-                    filter_clauses.append(
-                        Q("bool", must_not=Q("range", available_int={"lt": 1})))
+                    filter_clauses.append(Q("range", available_int={"gte": 1}))
                 continue
             if not v:
                 continue
@@ -175,7 +174,9 @@ class LindormConnection(DocStoreConnection):
 
         s_text = Search()
         full_text_query = Q("bool", must=[], filter=filter_query.filter)
-
+        vector_similarity_weight = 0.3
+        topk = 0
+        knn_query = False
         for m in matchExprs:
             if isinstance(m, FusionExpr) and m.method == "weighted_sum" and "weights" in m.fusion_params:
                 assert len(matchExprs) == 3 and isinstance(matchExprs[0], MatchTextExpr) and isinstance(matchExprs[1],
@@ -183,8 +184,9 @@ class LindormConnection(DocStoreConnection):
                     matchExprs[2], FusionExpr)
                 weights = m.fusion_params["weights"]
                 vector_similarity_weight = float(weights.split(",")[1])
+                knn_query = abs(vector_similarity_weight - 1.0) < 1e-6
         for m in matchExprs:
-            if isinstance(m, MatchTextExpr):
+            if isinstance(m, MatchTextExpr) and abs(vector_similarity_weight - 1.0) > 1e-6:
                 minimum_should_match = m.extra_options.get("minimum_should_match", 0.0)
                 if isinstance(minimum_should_match, float):
                     minimum_should_match = str(int(minimum_should_match * 100)) + "%"
@@ -194,17 +196,28 @@ class LindormConnection(DocStoreConnection):
 
                 full_text_query = Q("bool", must=[text_must_clause], filter=filter_query.filter)
             elif isinstance(m, MatchDenseExpr):
+                assert (filter_query is not None)
+                similarity = 0.0
+                if "similarity" in m.extra_options and knn_query:
+                    similarity = m.extra_options["similarity"]
+                vector_column = m.vector_column_name
                 knn_filter_dict = filter_query.to_dict()
-
+                topk = m.topn
                 knn_inner_query = {
-                    m.vector_column_name: {
+                    vector_column: {
                         "vector": list(m.embedding_data),
-                        "k": m.topn,
+                        "k": topk,
                         "filter": knn_filter_dict
                     }
                 }
 
-                q_vector_dict = {"query": {"knn": knn_inner_query}, "size": limit, "from": offset, "_source": True}
+                q_vector_dict = {
+                    "query": {"knn": knn_inner_query},
+                    "size": limit,
+                    "from": offset,
+                    "_source": True,
+                    "ext": {"lvector": {"filter_type": "efficient_filter", "min_score": str(similarity)}}
+                }
 
         if full_text_query and rank_feature:
             full_text_query.should = []
@@ -242,7 +255,24 @@ class LindormConnection(DocStoreConnection):
         q_text_dict = s_text.to_dict()
         q_text_dict["_source"] = True
 
-        if q_text_dict and q_vector_dict:
+        if q_vector_dict and knn_query:
+            for i in range(ATTEMPT_TIME):
+                try:
+                    res = self.client.search(index=indexNames,
+                                         body=q_vector_dict,
+                                         timeout=600)
+                    if str(res.get("timed_out", "")).lower() == "true":
+                        raise Exception("LindormConnection Timeout.")
+                    logger.debug(f"LindormConnection.search {str(indexNames)} res: " + str(res))
+                    return res
+                except Exception as e:
+                    logger.exception(f"LindormConnection.search {str(indexNames)} query: " + str(q_vector_dict))
+                    if "Timeout" in str(e):
+                        continue
+                    raise e
+            logger.error(f"LindormConnection.search timeout for {ATTEMPT_TIME} times!")
+            raise Exception("LindormConnection.search timeout.")
+        elif q_text_dict and q_vector_dict:
             msearch_body = []
             target_index_str = ",".join(indexNames)
 
@@ -264,8 +294,7 @@ class LindormConnection(DocStoreConnection):
                         raise Exception("Lindorm Timeout: One or more sub-queries in msearch timed out.")
 
                     logger.debug(f"LindormConnection.search msearch res: " + str(res))
-
-                    return self.rerank_with_rrf(res["responses"], rrf_rank_constant=60, vector_similarity_weight = vector_similarity_weight)
+                    return self.hybrid_rank(res["responses"], vector_similarity_weight = vector_similarity_weight, limit = limit)
 
                 except Exception as e:
                     logger.exception(
@@ -295,7 +324,7 @@ class LindormConnection(DocStoreConnection):
             logger.error(f"LindormConnection.search timeout for {ATTEMPT_TIME} times!")
             raise Exception("LindormConnection.search timeout.")
 
-    def rerank_with_rrf(self, msearch_responses: list, rrf_rank_constant: int = 60, vector_similarity_weight: float = 0.5):
+    def hybrid_rank(self, msearch_responses: list, vector_similarity_weight: float = 0.95, get_vector: bool = True, limit: int = 10):
         text_response = msearch_responses[0] if len(msearch_responses) > 0 else None
         vector_response = msearch_responses[1] if len(msearch_responses) > 1 else None
         if text_response is None and vector_response is None:
@@ -310,34 +339,37 @@ class LindormConnection(DocStoreConnection):
 
         scores = {}
         docs = {}
-
-        text_rank_constant = self.get_rank_constant_by_factor(vector_similarity_weight, rrf_rank_constant)
-
-        if text_response and not text_response.get("error"):
-            text_hits = text_response.get("hits", {}).get("hits", [])
-            for rank, hit in enumerate(text_hits, 1):
-                doc_id = hit["_id"]
-                rrf_score = 1.0 / (text_rank_constant + rank)
-                scores[doc_id] = scores.get(doc_id, 0) + rrf_score
-                if doc_id not in docs:
-                    docs[doc_id] = hit
+        text_similarity_weight = 1.0 - vector_similarity_weight
 
         if vector_response and not vector_response.get("error"):
             vector_hits = vector_response.get("hits", {}).get("hits", [])
             for rank, hit in enumerate(vector_hits, 1):
                 doc_id = hit["_id"]
-                rrf_score = 1.0 / (rrf_rank_constant + rank)
-                scores[doc_id] = scores.get(doc_id, 0) + rrf_score
+                hybrid_similarity_score = vector_similarity_weight * hit["_score"]
+                scores[doc_id] = scores.get(doc_id, 0) + hybrid_similarity_score
                 if doc_id not in docs:
                     docs[doc_id] = hit
 
-        sorted_docs = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if text_response and not text_response.get("error"):
+            text_hits = text_response.get("hits", {}).get("hits", [])
+            for rank, hit in enumerate(text_hits, 1):
+                doc_id = hit["_id"]
+                if doc_id in docs:
+                    hybrid_similarity_score = text_similarity_weight * hit["_score"] * 0.05
+                    scores[doc_id] = scores.get(doc_id, 0) + hybrid_similarity_score
+                    if "highlight" in hit and hit["highlight"]:
+                        docs[doc_id]["highlight"] = hit["highlight"]
+
+        sorted_docs = sorted(scores.items(), key=lambda item: item[1], reverse=True)[:limit]
 
         final_hits = []
+        max_score = 0
         for doc_id, final_score in sorted_docs:
             doc_info = docs[doc_id]
 
             source_data = doc_info.get("_source") or {}
+            score = doc_info.get("_score", 0)
+            max_score = max(max_score, score)
 
             if isinstance(source_data, dict):
                 source_data['id'] = doc_id
@@ -345,7 +377,7 @@ class LindormConnection(DocStoreConnection):
             final_hit = {
                 "_index": doc_info.get("_index"),
                 "_id": doc_id,
-                "_score": final_score,
+                "_score": score,
                 "_source": source_data,
                 "highlight": doc_info.get("highlight")
             }
@@ -360,24 +392,11 @@ class LindormConnection(DocStoreConnection):
             "timed_out": is_timed_out,
             "hits": {
                 "total": {"value": len(docs), "relation": "eq"},
-                "max_score": sorted_docs[0][1] if sorted_docs else 0.0,
+                "max_score": max_score,
                 "hits": final_hits
             }
         }
-
         return final_result
-
-    def get_rank_constant_by_factor(self, knn_weight_factor: float, rrf_rank_constant: int) -> int:
-        rank_constant_factor: float
-        if knn_weight_factor < 0 or knn_weight_factor > 1:
-            rank_constant_factor = 0.5
-        elif knn_weight_factor == 0:
-            rank_constant_factor = 1e-6  # 0.000001
-        elif knn_weight_factor == 1:
-            rank_constant_factor = 1 / 1e-6  # 1,000,000
-        else:
-            rank_constant_factor = knn_weight_factor / (1 - knn_weight_factor)
-        return int(rrf_rank_constant * rank_constant_factor)
 
     def get(self, chunkId: str, indexName: str, knowledgebaseIds: list[str]) -> dict | None:
         print("LindormConnection.get")

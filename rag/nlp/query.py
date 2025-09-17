@@ -226,6 +226,15 @@ class FulltextQueryer:
             return np.array(tksim), tksim, sims[0]
         return np.array(sims[0]) * vtweight + np.array(tksim) * tkweight, tksim, sims[0]
 
+    def hybrid_similarity_with_score(self, score, atks, btkss, tkweight=0.3, vtweight=0.7):
+        import numpy as np
+
+        tksim = self.token_similarity(atks, btkss)
+        sims = np.array(score)
+        if np.sum(sims) == 0:
+            return np.array(tksim), tksim, sims
+        return np.array(sims) * vtweight + np.array(tksim) * tkweight, tksim, sims
+
     def token_similarity(self, atks, btkss):
         def toDict(tks):
             if isinstance(tks, str):
